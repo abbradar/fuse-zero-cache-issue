@@ -1,0 +1,71 @@
+From 007c8531c0644e259321b8e1b151003439f75ebf Mon Sep 17 00:00:00 2001
+From: Nikolay Amiantov <ab@fmap.me>
+Date: Wed, 15 Apr 2026 07:28:19 +0000
+Subject: [PATCH] fuse: fix stale page cache data race on file growth
+
+When a FUSE server reports a larger file size via lookup or getattr,
+fuse_change_attributes() updates i_size before invalidating stale page
+cache entries. The page before the EOF contains kernel-generated
+zero-fill beyond the old i_size. Once i_size is increased, these zeroes
+become visible to concurrent readers before we invalidate the cache
+later on.
+
+Fix this by evicting the affected page before updating i_size. The fi->lock
+spinlock is dropped before the invalidation (which can sleep), then
+reacquired to recheck FUSE_I_SIZE_UNSTABLE before updating i_size.
+---
+ fs/fuse/inode.c | 38 ++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/fs/fuse/inode.c b/fs/fuse/inode.c
+index 735abf426a06..61ae0f94e4dc 100644
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@ -334,8 +334,42 @@ void fuse_change_attributes(struct inode *inode, struct fuse_attr *attr,
+ 	 * extend local i_size without keeping userspace server in sync. So,
+ 	 * attr->size coming from server can be stale. We cannot trust it.
+ 	 */
+-	if (!(cache_mask & STATX_SIZE))
+-		i_size_write(inode, attr->size);
++	if (!(cache_mask & STATX_SIZE)) {
++		/*
++		 * When a file grows remotely, the page straddling the old
++		 * EOF contains zero-fill beyond oldsize.  Those zeroes are
++		 * valid while i_size equals oldsize (they are beyond EOF),
++		 * but become stale once i_size is increased: concurrent
++		 * readers would see zeroes instead of the data written by
++		 * the remote host. Evict the affected page(s) BEFORE updating
++		 * i_size.  Any reader that re-populates the cache between the
++		 * invalidation and the i_size update will issue a fresh
++		 * FUSE_READ with the new data there.
++		 *
++		 * There is a residual race: a reader that has
++		 * already obtained a folio reference via the lockless
++		 * filemap_get_read_batch() but has not yet reached the
++		 * i_size_read() in filemap_read() would hold a ref that
++		 * prevents invalidate_inode_pages2_range() from evicting
++		 * the folio.  The reader would then use the new i_size
++		 * (read after our i_size_write) to copy stale data.
++		 */
++		if (S_ISREG(inode->i_mode) && attr->size > oldsize) {
++			spin_unlock(&fi->lock);
++			invalidate_inode_pages2_range(inode->i_mapping,
++						      oldsize >> PAGE_SHIFT,
++						      (attr->size - 1) >> PAGE_SHIFT);
++			spin_lock(&fi->lock);
++			/*
++			 * Recheck — a write or truncate may have set
++			 * FUSE_I_SIZE_UNSTABLE while we dropped the lock.
++			 */
++			if (!test_bit(FUSE_I_SIZE_UNSTABLE, &fi->state))
++				i_size_write(inode, attr->size);
++		} else {
++			i_size_write(inode, attr->size);
++		}
++	}
+ 	spin_unlock(&fi->lock);
+ 
+ 	if (!cache_mask && S_ISREG(inode->i_mode)) {
+-- 
+2.47.0
+
