@@ -195,6 +195,8 @@ Bug reproduced: 20 stale-zero region(s) in 187.9s (24747949 bytes read).
 
 ## The VFS issue
 
+This is copied from my [NFS MRE](https://github.com/abbradar/nfs_stale_cache_test) which reproduces a similar bug and is my current understanding of the underlying VFS issue:
+
 When a file grows remotely, the page before the old EOF in the read cache contains zero-fill beyond the old size. Those zeroes are valid while new size <= old size (they are beyond EOF), but become stale once the new size is updated to reflect the remote growth: the remote host wrote real data there, but the local cache still has the old zero-fill.
 
 In filemap_read() (mm/filemap.c) we have:
